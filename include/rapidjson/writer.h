@@ -581,6 +581,167 @@ inline bool Writer<StringBuffer>::WriteDouble(double d) {
     return true;
 }
 
+RAPIDJSON_FORCEINLINE inline const char* ScanUnescapedString(const char* p, const char* end) {
+    while (p != end) {
+        const unsigned char c = static_cast<unsigned char>(*p);
+        if (RAPIDJSON_UNLIKELY(c < 0x20 || c == '\"' || c == '\\'))
+            break;
+        ++p;
+    }
+    return p;
+}
+
+RAPIDJSON_FORCEINLINE inline void CopyStringRange(StringBuffer& os, const char* src, SizeType length) {
+    if (length == 0)
+        return;
+
+    char* dst = os.PushUnsafe(length);
+    if (length < 8) {
+        for (SizeType i = 0; i < length; ++i)
+            dst[i] = src[i];
+    }
+    else
+        std::memcpy(dst, src, length);
+}
+
+#if defined(RAPIDJSON_SSE2) || defined(RAPIDJSON_SSE42)
+RAPIDJSON_FORCEINLINE inline const char* CopyUnescapedString(StringBuffer& os, const char* p, const char* end) {
+    const SizeType length = static_cast<SizeType>(end - p);
+    if (length < 16) {
+        const char* q = ScanUnescapedString(p, end);
+        if (static_cast<SizeType>(q - p) >= 8) {
+            CopyStringRange(os, p, static_cast<SizeType>(q - p));
+            return q;
+        }
+        return p;
+    }
+
+    const char* nextAligned = reinterpret_cast<const char*>((reinterpret_cast<size_t>(p) + 15) & static_cast<size_t>(~15));
+    const char* endAligned = reinterpret_cast<const char*>(reinterpret_cast<size_t>(end) & static_cast<size_t>(~15));
+    const char* q = ScanUnescapedString(p, nextAligned);
+    if (q != nextAligned) {
+        if (static_cast<SizeType>(q - p) >= 8) {
+            CopyStringRange(os, p, static_cast<SizeType>(q - p));
+            return q;
+        }
+        return p;
+    }
+
+    CopyStringRange(os, p, static_cast<SizeType>(q - p));
+    p = q;
+
+    static const char dquote[16] = { '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"', '\"' };
+    static const char bslash[16] = { '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\' };
+    static const char space[16]  = { 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F };
+    const __m128i dq = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&dquote[0]));
+    const __m128i bs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&bslash[0]));
+    const __m128i sp = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&space[0]));
+
+    for (; p != endAligned; p += 16) {
+        const __m128i s = _mm_load_si128(reinterpret_cast<const __m128i *>(p));
+        const __m128i t1 = _mm_cmpeq_epi8(s, dq);
+        const __m128i t2 = _mm_cmpeq_epi8(s, bs);
+        const __m128i t3 = _mm_cmpeq_epi8(_mm_max_epu8(s, sp), sp);
+        const __m128i x = _mm_or_si128(_mm_or_si128(t1, t2), t3);
+        const unsigned short r = static_cast<unsigned short>(_mm_movemask_epi8(x));
+        if (RAPIDJSON_UNLIKELY(r != 0)) {
+            SizeType len;
+#ifdef _MSC_VER
+            unsigned long offset;
+            _BitScanForward(&offset, r);
+            len = offset;
+#else
+            len = static_cast<SizeType>(__builtin_ffs(r) - 1);
+#endif
+            CopyStringRange(os, p, len);
+            return p + len;
+        }
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(os.PushUnsafe(16)), s);
+    }
+
+    q = ScanUnescapedString(p, end);
+    CopyStringRange(os, p, static_cast<SizeType>(q - p));
+    return q;
+}
+#elif defined(RAPIDJSON_NEON)
+RAPIDJSON_FORCEINLINE inline const char* CopyUnescapedString(StringBuffer& os, const char* p, const char* end) {
+    const SizeType length = static_cast<SizeType>(end - p);
+    if (length < 16) {
+        const char* q = ScanUnescapedString(p, end);
+        if (static_cast<SizeType>(q - p) >= 8) {
+            CopyStringRange(os, p, static_cast<SizeType>(q - p));
+            return q;
+        }
+        return p;
+    }
+
+    const char* nextAligned = reinterpret_cast<const char*>((reinterpret_cast<size_t>(p) + 15) & static_cast<size_t>(~15));
+    const char* endAligned = reinterpret_cast<const char*>(reinterpret_cast<size_t>(end) & static_cast<size_t>(~15));
+    const char* q = ScanUnescapedString(p, nextAligned);
+    if (q != nextAligned) {
+        if (static_cast<SizeType>(q - p) >= 8) {
+            CopyStringRange(os, p, static_cast<SizeType>(q - p));
+            return q;
+        }
+        return p;
+    }
+
+    CopyStringRange(os, p, static_cast<SizeType>(q - p));
+    p = q;
+
+    const uint8x16_t s0 = vmovq_n_u8('"');
+    const uint8x16_t s1 = vmovq_n_u8('\\');
+    const uint8x16_t s2 = vmovq_n_u8('\b');
+    const uint8x16_t s3 = vmovq_n_u8(32);
+
+    for (; p != endAligned; p += 16) {
+        const uint8x16_t s = vld1q_u8(reinterpret_cast<const uint8_t *>(p));
+        uint8x16_t x = vceqq_u8(s, s0);
+        x = vorrq_u8(x, vceqq_u8(s, s1));
+        x = vorrq_u8(x, vceqq_u8(s, s2));
+        x = vorrq_u8(x, vcltq_u8(s, s3));
+
+        x = vrev64q_u8(x);
+        const uint64_t low = vgetq_lane_u64(vreinterpretq_u64_u8(x), 0);
+        const uint64_t high = vgetq_lane_u64(vreinterpretq_u64_u8(x), 1);
+
+        SizeType len = 0;
+        bool escaped = false;
+        if (low == 0) {
+            if (high != 0) {
+                const uint32_t lz = internal::clzll(high);
+                len = 8 + (lz >> 3);
+                escaped = true;
+            }
+        } else {
+            const uint32_t lz = internal::clzll(low);
+            len = lz >> 3;
+            escaped = true;
+        }
+
+        if (RAPIDJSON_UNLIKELY(escaped)) {
+            CopyStringRange(os, p, len);
+            return p + len;
+        }
+
+        vst1q_u8(reinterpret_cast<uint8_t *>(os.PushUnsafe(16)), s);
+    }
+
+    q = ScanUnescapedString(p, end);
+    CopyStringRange(os, p, static_cast<SizeType>(q - p));
+    return q;
+}
+#else
+RAPIDJSON_FORCEINLINE inline const char* CopyUnescapedString(StringBuffer& os, const char* p, const char* end) {
+    const char* q = ScanUnescapedString(p, end);
+    if (static_cast<SizeType>(q - p) >= 8) {
+        CopyStringRange(os, p, static_cast<SizeType>(q - p));
+        return q;
+    }
+    return p;
+}
+#endif
+
 #if defined(RAPIDJSON_SSE2) || defined(RAPIDJSON_SSE42)
 template<>
 inline bool Writer<StringBuffer>::ScanWriteUnescapedString(StringStream& is, size_t length) {
@@ -711,6 +872,86 @@ inline bool Writer<StringBuffer>::ScanWriteUnescapedString(StringStream& is, siz
     return RAPIDJSON_LIKELY(is.Tell() < length);
 }
 #endif // RAPIDJSON_NEON
+
+template<>
+inline bool Writer<StringBuffer>::WriteString(const char* str, SizeType length) {
+    static const char hexDigits[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
+    static const char escape[256] = {
+#define Z16 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+        //0    1    2    3    4    5    6    7    8    9    A    B    C    D    E    F
+        'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'b', 't', 'n', 'u', 'f', 'r', 'u', 'u', // 00
+        'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', 'u', // 10
+          0,   0, '"',   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0, // 20
+        Z16, Z16,                                                                       // 30~4F
+          0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,'\\',   0,   0,   0, // 50
+        Z16, Z16, Z16, Z16, Z16, Z16, Z16, Z16, Z16, Z16                                // 60~FF
+#undef Z16
+    };
+
+    PutReserve(*os_, 2 + length * 6);
+    PutUnsafe(*os_, '\"');
+
+    const char* p = str;
+    const char* end = str + length;
+    while (p != end) {
+        if (static_cast<SizeType>(end - p) >= 8) {
+            const char* const q = CopyUnescapedString(*os_, p, end);
+            if (q != p) {
+                p = q;
+                if (p == end)
+                    break;
+            }
+        }
+
+        if (static_cast<SizeType>(end - p) < 8) {
+            while (p != end) {
+                const unsigned char c = static_cast<unsigned char>(*p++);
+                const char escaped = escape[c];
+                if (RAPIDJSON_LIKELY(!escaped)) {
+                    PutUnsafe(*os_, static_cast<char>(c));
+                }
+                else if (escaped == 'u') {
+                    char* out = os_->PushUnsafe(6);
+                    out[0] = '\\';
+                    out[1] = 'u';
+                    out[2] = '0';
+                    out[3] = '0';
+                    out[4] = hexDigits[c >> 4];
+                    out[5] = hexDigits[c & 0x0F];
+                }
+                else {
+                    char* out = os_->PushUnsafe(2);
+                    out[0] = '\\';
+                    out[1] = escaped;
+                }
+            }
+            break;
+        }
+
+        const unsigned char c = static_cast<unsigned char>(*p++);
+        const char escaped = escape[c];
+        if (RAPIDJSON_LIKELY(!escaped)) {
+            PutUnsafe(*os_, static_cast<char>(c));
+        }
+        else if (escaped == 'u') {
+            char* out = os_->PushUnsafe(6);
+            out[0] = '\\';
+            out[1] = 'u';
+            out[2] = '0';
+            out[3] = '0';
+            out[4] = hexDigits[c >> 4];
+            out[5] = hexDigits[c & 0x0F];
+        }
+        else {
+            char* out = os_->PushUnsafe(2);
+            out[0] = '\\';
+            out[1] = escaped;
+        }
+    }
+
+    PutUnsafe(*os_, '\"');
+    return true;
+}
 
 RAPIDJSON_NAMESPACE_END
 
