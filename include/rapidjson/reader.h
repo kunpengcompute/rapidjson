@@ -1072,6 +1072,52 @@ private:
             // Do nothing for generic version
     }
 
+    // Encoded UTF-8 memory stream path: scan and copy a contiguous unescaped segment.
+    // Kept as an isolated overload to avoid touching existing SIMD/scalar implementations.
+    static RAPIDJSON_FORCEINLINE void ScanCopyUnescapedString(EncodedInputStream<UTF8<>, MemoryStream>& is, StackStream<char>& os) {
+        const char* const src = is.is_.src_;
+        const char* p = src;
+        const char* const end = is.is_.end_;
+
+#if defined(RAPIDJSON_NEON)
+        const uint8x16_t dq = vmovq_n_u8(0x22);
+        const uint8x16_t bs = vmovq_n_u8(0x5C);
+        const uint8x16_t sp = vmovq_n_u8(32);
+
+        while (p + 16 <= end) {
+            const uint8x16_t v = vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+            uint8x16_t x = vceqq_u8(v, dq);
+            x = vorrq_u8(x, vceqq_u8(v, bs));
+            x = vorrq_u8(x, vcltq_u8(v, sp));
+
+            x = vrev64q_u8(x);
+            const uint64_t low = vgetq_lane_u64(vreinterpretq_u64_u8(x), 0);
+            const uint64_t high = vgetq_lane_u64(vreinterpretq_u64_u8(x), 1);
+
+            if (RAPIDJSON_UNLIKELY(low != 0 || high != 0)) {
+                if (low != 0)
+                    p += internal::clzll(low) >> 3;
+                else
+                    p += 8 + (internal::clzll(high) >> 3);
+                break;
+            }
+
+            p += 16;
+        }
+#endif
+
+        while (p != end && RAPIDJSON_LIKELY(*p != '"' && *p != '\\' && static_cast<unsigned char>(*p) >= 0x20))
+            ++p;
+
+        const SizeType length = static_cast<SizeType>(p - src);
+        if (RAPIDJSON_LIKELY(length != 0)) {
+            char* q = reinterpret_cast<char*>(os.Push(length));
+            std::memcpy(q, src, static_cast<size_t>(length));
+        }
+
+        is.is_.src_ = p;
+    }
+
 #if defined(RAPIDJSON_SSE2) || defined(RAPIDJSON_SSE42)
     // StringStream -> StackStream<char>
     static RAPIDJSON_FORCEINLINE void ScanCopyUnescapedString(StringStream& is, StackStream<char>& os) {
